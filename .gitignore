@@ -3,6 +3,15 @@ debug_info
 twiddle
 deepseek-wasm/
 tokens
+
 __pycache__/
 *.pyc
 *.pyo
+
+.venv/
+*.backup
+*.backup-*
+*.before*
+*.json5
+patch.py
+.DS_Store

@@ -140,7 +140,7 @@ class DeepSeekChat:
                 event='UNKNOWN'#ready=preparing update_session=outputting title close
                 think=''
                 respond=''
-                generate_mode=''#THINK RESPONSE SEARCH TIP(This content is AI-generated... stuff)
+                generate_mode='RESPONSE'# default to response mode
                 parid,msgid,reqid,resid=None,None,None,None #suspect parid=reqid msgid=resid NOT SURE
                 tokencount=None
                 title=''
@@ -163,7 +163,11 @@ class DeepSeekChat:
                         elif generate_mode=='TIP':
                             pass
                         else:
-                            raise Exception(f"Unexptected string in mode {generate_mode}\nData: {line}")
+                            # Capture early response fragments before mode marker arrives
+                            respond += data
+                            if printing:
+                                send_to_sd(data)
+                            return
                         if printing:
                             send_to_sd(data)
                         return
@@ -178,9 +182,19 @@ class DeepSeekChat:
                                 send_to_sd(f"{data.get('cite_index','?')}. [{data.get('title',data.get('site_name','UNKNOWN'))} - {data.get('site_name','UNKNOWN')}]({data['url']})\n")
                                 send_to_sd('> '+data.get('snippet','')+"\n")
                         elif 'v' in data and len(data)==1:
+                            if generate_mode == 'THINK':
+                                return
                             parse_output(data['v'],line)
                         elif 'response' in data and len(data)==1:
-                            parse_output(data['response'],line)
+                            # Handle initial response fragments
+                            # DeepSeek sends the first token(s) here:
+                            # {"response":{"fragments":[{"content":"Lee"}]}}
+                            if isinstance(data['response'], dict) and 'fragments' in data['response']:
+                                for fragment in data['response']['fragments']:
+                                    if isinstance(fragment, dict) and 'content' in fragment:
+                                        parse_output(fragment['content'], line)
+                            else:
+                                parse_output(data['response'],line)
                         elif 'message_id' in data or 'parent_id' in data:
                             parid=data.get('parent_id',parid)
                             msgid=data.get('message_id',msgid)
@@ -189,6 +203,8 @@ class DeepSeekChat:
                         elif 'p' in data:
                             tp=data['p'].split('/')[-1]
                             if tp in ['response','content','fragment','fragments']:
+                                if tp == 'content' and generate_mode == '':
+                                    generate_mode='RESPONSE'
                                 parse_output(data['v'],line)
                             elif tp=='status':
                                 if printing:
@@ -216,6 +232,8 @@ class DeepSeekChat:
                         raise Exception(f"Unrecognizable type {type(data)}\nData: {line}")
                 send_to_sd('\n')
                 for line in response.iter_lines(decode_unicode=True):
+                    if line:
+                        print("RAW:", line)
                     if line and len(line)>0:
                         if type(line)==str:
                             if line.startswith('data: '):

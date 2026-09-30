@@ -39,88 +39,115 @@ def get_model_config(model: str):
 
 def chat_non_streaming(messages, model_type="default", thinking_enabled=True):
     """Non-streaming chat"""
+
     user_message = messages[-1]["content"] if messages else ""
-    
-    # Redirect stdout to capture output
-    old_stdout = sys.stdout
-    sys.stdout = mystdout = StringIO()
-    
-    try:
-        chat = DeepSeekChat(DS_SESSION_ID, AUTHORIZATION_TOKEN)
-        chat.send_message(user_message, printing=True, thinking_enabled=thinking_enabled, search_enabled=False, model_type=model_type)
-    finally:
-        sys.stdout = old_stdout
-    
-    output = mystdout.getvalue()
-    
-    # Parse output to extract response
-    in_response = False
-    response_text = ""
-    
-    for line in output.split('\n'):
-        if 'START RESPONSE' in line:
-            in_response = True
-            continue
-        elif 'FINISHED' in line:
-            in_response = False
-            break
-        elif 'START THINK' in line:
-            in_response = False
-            continue
-        
-        if in_response and line.strip():
-            response_text += line + '\n'
-    
-    return response_text.strip() if response_text else output
+
+    chat = DeepSeekChat(DS_SESSION_ID, AUTHORIZATION_TOKEN)
+    chat.chat_session_id = None
+    chat.parent_message_id = None
+
+    result = chat.send_message(
+        user_message,
+        printing=False,
+        thinking_enabled=thinking_enabled,
+        search_enabled=False,
+        model_type=model_type
+    )
+
+    if result and result.get("ok"):
+        response = result["content"].get("response", "")
+
+        # Remove leaked reasoning prefixes
+        markers = [
+            "We need answer",
+            "Need answer",
+            "Let's craft",
+            "Need to",
+            "User asks"
+        ]
+
+        for marker in markers:
+            if response.startswith(marker):
+                idx = response.find("\\n\\n")
+                if idx != -1:
+                    response = response[idx+2:]
+
+        return response
+
+    return ""
+
 
 def chat_streaming(messages, model_type="default", thinking_enabled=True):
     """Streaming chat using SSE"""
+
     user_message = messages[-1]["content"] if messages else ""
-    
-    # Redirect stdout to capture output
-    old_stdout = sys.stdout
-    sys.stdout = mystdout = StringIO()
-    
-    try:
-        chat = DeepSeekChat(DS_SESSION_ID, AUTHORIZATION_TOKEN)
-        chat.send_message(user_message, printing=True, thinking_enabled=thinking_enabled, search_enabled=False, model_type=model_type)
-    finally:
-        sys.stdout = old_stdout
-    
-    output = mystdout.getvalue()
-    
-    # Parse and yield tokens
-    in_thinking = False
-    in_response = False
-    
-    for line in output.split('\n'):
-        if 'START THINK' in line:
-            in_thinking = True
-            in_response = False
-            continue
-        elif 'START RESPONSE' in line:
-            in_thinking = False
-            in_response = True
-            continue
-        elif 'FINISHED' in line:
-            in_response = False
-            break
-        
-        if in_thinking:
-            continue  # Skip thinking in streaming for now
-        elif in_response:
-            if line.strip():
-                content_line = line + '\n'
-                data_str = json.dumps({'choices': [{'delta': {'content': content_line}}]})
-                yield "data: " + data_str + "\n\n"
-    
+
+    chat = DeepSeekChat(DS_SESSION_ID, AUTHORIZATION_TOKEN)
+    chat.chat_session_id = None
+    chat.parent_message_id = None
+
+    result = chat.send_message(
+        user_message,
+        printing=False,
+        thinking_enabled=thinking_enabled,
+        search_enabled=False,
+        model_type=model_type
+    )
+
+    if result and result.get("ok"):
+        response_text = result["content"].get("response", "")
+    else:
+        response_text = ""
+
+    # Emit OpenAI-compatible SSE chunks
+    chunk_size = 20
+
+    for i in range(0, len(response_text), chunk_size):
+        content = response_text[i:i+chunk_size]
+
+        data_str = json.dumps({
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "content": content
+                    }
+                }
+            ]
+        })
+
+        yield "data: " + data_str + "\n\n"
+
     yield "data: [DONE]\n\n"
+
 
 @app.route("/v1/chat/completions", methods=["POST"])
 def chat_completions():
     data = request.json
     
     messages = data.get("messages", [])
+
+    # Remove only failed OpenClaw assistant turns
+    bad_phrases = [
+        "[assistant turn failed before producing content]",
+        "don't have a previous question or task to continue from",
+        "don't have the earlier context from this conversation",
+        "don't have access to the previous conversation state",
+        "Could you tell me what you'd like me to answer",
+        "Could you share the previous question or context",
+    ]
+
+    messages = [
+        m for m in messages
+        if not (
+            m.get("role") == "assistant"
+            and any(
+                phrase in m.get("content", "")
+                for phrase in bad_phrases
+            )
+        )
+    ]
+
     stream = data.get("stream", False)
     
     # Determine model - default to DeepSeek V3.

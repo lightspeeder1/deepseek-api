@@ -38,6 +38,122 @@ def get_model_config(model: str):
     thinking_enabled = "r1" in model_lower or "r4" in model_lower or "reasoning" in model_lower or "reasoner" in model_lower
     return model_type, thinking_enabled
 
+
+def build_tool_prompt(messages, tools):
+    """Convert OpenAI messages/tools into a prompt DeepSeek can understand."""
+
+    conversation = []
+
+    for message in messages:
+        role = message.get("role", "user")
+        content = message.get("content") or ""
+
+        # Preserve assistant tool-call context.
+        if role == "assistant" and message.get("tool_calls"):
+            conversation.append(
+                "ASSISTANT TOOL CALLS:\n" +
+                json.dumps(message["tool_calls"], ensure_ascii=False)
+            )
+            continue
+
+        # Preserve tool results returned by the client.
+        if role == "tool":
+            tool_call_id = message.get("tool_call_id", "")
+            name = message.get("name", "")
+            conversation.append(
+                f"TOOL RESULT"
+                f"{' ' + name if name else ''}"
+                f"{' (' + tool_call_id + ')' if tool_call_id else ''}:\n"
+                f"{content}"
+            )
+            continue
+
+        conversation.append(f"{role.upper()}:\n{content}")
+
+    tool_defs = []
+
+    for tool in tools or []:
+        if tool.get("type") != "function":
+            continue
+
+        fn = tool.get("function", {})
+
+        tool_defs.append({
+            "name": fn.get("name"),
+            "description": fn.get("description", ""),
+            "parameters": fn.get("parameters", {
+                "type": "object",
+                "properties": {}
+            })
+        })
+
+    if not tool_defs:
+        return "\n\n".join(conversation)
+
+    instructions = """
+You have access to tools.
+
+If a tool is required, respond ONLY with valid JSON in exactly this form:
+
+{"tool_call":{"name":"TOOL_NAME","arguments":{}}}
+
+Do not wrap the JSON in markdown.
+Do not explain the tool call.
+Use only tools listed below.
+
+If no tool is required, answer normally.
+
+AVAILABLE TOOLS:
+""" + json.dumps(tool_defs, ensure_ascii=False, indent=2)
+
+    return instructions + "\n\nCONVERSATION:\n" + "\n\n".join(conversation)
+
+
+def parse_tool_call(text):
+    """Parse the gateway's JSON tool-call protocol."""
+
+    if not isinstance(text, str):
+        return None
+
+    candidate = text.strip()
+
+    # Tolerate models wrapping JSON in a markdown fence.
+    if candidate.startswith("```"):
+        lines = candidate.splitlines()
+
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+
+        candidate = "\n".join(lines).strip()
+
+    try:
+        data = json.loads(candidate)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    call = data.get("tool_call")
+
+    if not isinstance(call, dict):
+        return None
+
+    name = call.get("name")
+    arguments = call.get("arguments", {})
+
+    if not isinstance(name, str) or not name:
+        return None
+
+    if not isinstance(arguments, dict):
+        return None
+
+    return {
+        "name": name,
+        "arguments": arguments
+    }
+
+
 def chat_non_streaming(messages, model_type="default", thinking_enabled=True):
     """Non-streaming chat"""
 
@@ -150,6 +266,7 @@ def chat_completions():
     ]
 
     stream = data.get("stream", False)
+    tools = data.get("tools", [])
     
     # Determine model - default to DeepSeek V3.
     model = data.get("model", "deepseek-v3")
@@ -157,6 +274,82 @@ def chat_completions():
     # Determine DeepSeek web model flags based on model name.
     model_type, thinking_enabled = get_model_config(model)
     
+    # OpenAI-compatible tool calling.
+    # For now this path is non-streaming; streaming tool calls are added separately.
+    if tools and not stream:
+        tool_prompt = build_tool_prompt(messages, tools)
+
+        result = chat_non_streaming(
+            [{"role": "user", "content": tool_prompt}],
+            model_type,
+            thinking_enabled
+        )
+
+        tool_call = parse_tool_call(result)
+
+        if tool_call:
+            # Only allow tools actually advertised by the client.
+            allowed_tools = {
+                tool.get("function", {}).get("name")
+                for tool in tools
+                if tool.get("type") == "function"
+            }
+
+            if tool_call["name"] in allowed_tools:
+                call_id = f"call_{int(time.time() * 1000000)}"
+
+                return jsonify({
+                    "id": f"chatcmpl-{int(time.time())}",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call["name"],
+                                    "arguments": json.dumps(
+                                        tool_call["arguments"],
+                                        ensure_ascii=False
+                                    )
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0
+                    }
+                })
+
+        # DeepSeek decided no tool was necessary.
+        return jsonify({
+            "id": f"chatcmpl-{int(time.time())}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": result
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": len(result.split()) if result else 0,
+                "total_tokens": len(result.split()) if result else 0
+            }
+        })
+
     if stream:
         return Response(
             stream_with_context(chat_streaming(messages, model_type, thinking_enabled)),

@@ -12,6 +12,7 @@ import sys
 from io import StringIO
 from flask import Flask, request, jsonify, Response, stream_with_context
 from DeepSeekAPI import DeepSeekChat
+from tools import list_tools, execute_tool
 
 app = Flask(__name__)
 
